@@ -6,6 +6,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://alcdn.msauth.net/browser/3.24.0/js/msal-browser.min.js"></script>
 <style>
 :root{
   --bg:#0f1318;
@@ -341,7 +342,117 @@ const storageBackend = {
   }
 };
 
-let state = { files:{import:null, export:null, wits:null}, manual:{}, remarks:{}, selected:null, category:"other", period:"all", periodFrom:"", periodTo:"", customItems:emptyPerCategory(), removedItems:emptyPerCategory(), showAddForm:false, uploadNotice:{import:null, export:null, wits:null}, uploadPanelExpanded:true, mappingCollapsed:{import:false, export:false, wits:false}, dataView:{import:true, export:true}, lastInsightsText:{}, previousUploadBannerDismissed:false, hsOverrides:{}, showExporterTab:false, showImporterTab:false, gdSchemeFilter:{dutyPaid:false, efs:false}, showUsd:false, fxRates:null, ourCompanyName:"", showCompanyView:false };
+// ---------- SharePoint / Microsoft 365 integration ----------
+// Real values from the user's Entra ID app registration — these are safe to be public
+// (Client ID and Tenant ID are not secrets; SPA apps have no client secret at all).
+const MSAL_CONFIG = {
+  auth: {
+    clientId: "912a9b6c-b48b-4793-bc7e-9f71f8b95a76",
+    authority: "https://login.microsoftonline.com/0a796a08-f4fc-4258-8392-0e7e39c8f54f",
+    redirectUri: window.location.origin + window.location.pathname,
+  },
+  cache: { cacheLocation: "sessionStorage" },
+};
+const GRAPH_SCOPES = ["Files.Read.All", "Sites.Read.All"];
+let msalInstance = null;
+let spAccessToken = null;
+
+function getMsalInstance(){
+  if(!msalInstance) msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+  return msalInstance;
+}
+
+// Signs the user in (popup) and returns a valid Graph API access token — reuses a cached
+// silent token when possible so this doesn't re-prompt every single time.
+async function ensureSharePointSignedIn(){
+  const app = getMsalInstance();
+  await app.initialize();
+  const accounts = app.getAllAccounts();
+  const account = accounts[0];
+  if(account){
+    try{
+      const result = await app.acquireTokenSilent({ scopes: GRAPH_SCOPES, account });
+      spAccessToken = result.accessToken;
+      return spAccessToken;
+    }catch(e){ /* falls through to interactive sign-in below */ }
+  }
+  const result = await app.loginPopup({ scopes: GRAPH_SCOPES });
+  spAccessToken = result.accessToken;
+  return spAccessToken;
+}
+
+// Encodes any SharePoint/OneDrive sharing URL into the Microsoft Graph "shares" ID format,
+// the standard documented way to resolve a plain sharing link into an actual Graph driveItem
+// reference (driveId + itemId) usable for listing/reading content.
+function encodeSharingUrl(sharingUrl){
+  const base64 = btoa(unescape(encodeURIComponent(sharingUrl)))
+    .replace(/=+$/,"").replace(/\//g,"_").replace(/\+/g,"-");
+  return "u!" + base64;
+}
+
+async function graphFetch(path, token){
+  const resp = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+    headers: { "Authorization": `Bearer ${token}` }
+  });
+  if(!resp.ok){
+    const body = await resp.text().catch(()=>"");
+    throw new Error(`Graph API ${resp.status}: ${body.slice(0,300)}`);
+  }
+  return resp.json();
+}
+
+// Resolves the configured folder sharing URL to its real driveId+itemId, then lists its
+// immediate file children (folders are shown but not recursed into, keeping this predictable).
+async function listSharePointFolder(folderSharingUrl, token){
+  const encoded = encodeSharingUrl(folderSharingUrl);
+  const folderItem = await graphFetch(`/shares/${encoded}/driveItem?$select=id,name,folder,parentReference`, token);
+  if(!folderItem.folder){
+    throw new Error(`That link doesn't point to a folder — got "${folderItem.name}" instead. Please paste a folder link, not a file link.`);
+  }
+  const driveId = folderItem.parentReference.driveId;
+  const children = await graphFetch(`/drives/${driveId}/items/${folderItem.id}/children?$select=id,name,size,file,folder,lastModifiedDateTime&$orderby=name`, token);
+  return { driveId, items: children.value || [] };
+}
+
+// Fetches a specific file's raw bytes from SharePoint via Graph API.
+async function fetchSharePointFileBytes(driveId, itemId, token){
+  const resp = await fetch(`https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`, {
+    headers: { "Authorization": `Bearer ${token}` }
+  });
+  if(!resp.ok) throw new Error(`Couldn't download the file (HTTP ${resp.status}).`);
+  return resp.arrayBuffer();
+}
+
+// Takes a file already fetched from SharePoint (name + raw bytes) and runs it through the
+// EXACT SAME parsing + merge pipeline as a manually-uploaded file — so everything downstream
+// (matching, ranking, Company View, PPT) works completely unchanged regardless of source.
+async function importSharePointFile(key, fileName, arrayBuffer){
+  const ext = fileName.split(".").pop().toLowerCase();
+  const existing = state.files[key];
+  const isDuplicate = existing && existing.uploads.some(u => u.fileName === fileName && u.size === arrayBuffer.byteLength);
+  if(isDuplicate){
+    state.uploadNotice[key] = { type:"dup", text:`"${fileName}" is already uploaded — skipped so data isn't duplicated.` };
+    render();
+    return;
+  }
+  let newHeaders, newRows;
+  if(ext === "xlsx" || ext === "xls"){
+    const wb = XLSX.read(arrayBuffer, {type:"array"});
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    newRows = XLSX.utils.sheet_to_json(sheet, {defval:""});
+    const headerRow = XLSX.utils.sheet_to_json(sheet, {header:1})[0] || [];
+    newHeaders = headerRow.filter(h => h !== "" && h !== undefined).map(String);
+  } else {
+    const text = new TextDecoder().decode(arrayBuffer);
+    const parsed = Papa.parse(text, { header:true, skipEmptyLines:true });
+    newHeaders = parsed.meta.fields || [];
+    newRows = parsed.data;
+  }
+  const fakeFile = { name: fileName, size: arrayBuffer.byteLength };
+  await mergeUpload(key, fakeFile, newHeaders, newRows);
+}
+
+let state = { files:{import:null, export:null, wits:null}, manual:{}, remarks:{}, selected:null, category:"other", period:"all", periodFrom:"", periodTo:"", customItems:emptyPerCategory(), removedItems:emptyPerCategory(), showAddForm:false, uploadNotice:{import:null, export:null, wits:null}, uploadPanelExpanded:true, mappingCollapsed:{import:false, export:false, wits:false}, dataView:{import:true, export:true}, lastInsightsText:{}, previousUploadBannerDismissed:false, hsOverrides:{}, showExporterTab:false, showImporterTab:false, gdSchemeFilter:{dutyPaid:false, efs:false}, showUsd:false, fxRates:null, ourCompanyName:"", showCompanyView:false, spFolderUrl:"https://novatexltd-my.sharepoint.com/:f:/g/personal/hkalim4vh_gatronova_com/IgD7A8_PS3R6SLtTs7denJxtATSnXVX_Vmahb0aD3VmhVfg?e=vlxqJh", spFiles:null, spStatus:"" };
 
 async function loadStorage(){
   for(const ft of FILE_TYPES){
@@ -541,6 +652,7 @@ function render(){
   const banner = previousUploadBannerEl();
   if(banner) app.appendChild(banner);
   app.appendChild(uploadSectionEl());
+  app.appendChild(sharePointSectionEl());
 
   const cvSection = document.createElement("div");
   cvSection.className = "section";
@@ -702,6 +814,94 @@ function uploadSectionEl(){
 function fmtCount(f){
   if(!f) return null;
   return f.rows.length.toLocaleString() + " rows";
+}
+
+function sharePointSectionEl(){
+  const section = document.createElement("div");
+  section.className = "section";
+  section.style.border = "1px solid var(--accent)";
+  section.innerHTML = `
+    <h4>🔗 Import from SharePoint</h4>
+    <div class="desc" style="margin-bottom:8px;">Connect once, then pick a file straight from your SharePoint folder — no manual download/upload needed.</div>
+    <div style="display:flex;gap:8px;align-items:end;margin-bottom:10px;">
+      <div style="flex:1;"><label>Folder link</label><input type="text" id="sp-folder-url" value="${escAttr(state.spFolderUrl)}" placeholder="Paste a SharePoint/OneDrive FOLDER link"></div>
+      <button class="btn small primary" id="sp-connect-btn">🔗 Connect &amp; List Files</button>
+    </div>
+    <div id="sp-status" class="empty-note">${escHtml(state.spStatus)}</div>
+    <div id="sp-files-holder"></div>
+  `;
+
+  section.querySelector("#sp-folder-url").addEventListener("change", (e)=>{
+    state.spFolderUrl = e.target.value.trim();
+  });
+
+  section.querySelector("#sp-connect-btn").addEventListener("click", async ()=>{
+    const statusEl = section.querySelector("#sp-status");
+    const folderUrl = section.querySelector("#sp-folder-url").value.trim();
+    if(!folderUrl){
+      statusEl.textContent = "Paste a SharePoint folder link first.";
+      return;
+    }
+    statusEl.textContent = "Connecting to Microsoft 365 — a sign-in window may open…";
+    try{
+      const token = await ensureSharePointSignedIn();
+      statusEl.textContent = "Signed in. Listing files in the folder…";
+      const { driveId, items } = await listSharePointFolder(folderUrl, token);
+      state.spFiles = { driveId, items };
+      state.spStatus = `Found ${items.filter(i=>i.file).length} file(s) in this folder.`;
+      render();
+    }catch(e){
+      statusEl.textContent = `Couldn't connect: ${e.message}`;
+    }
+  });
+
+  if(state.spFiles && state.spFiles.items.length > 0){
+    const filesHolder = section.querySelector("#sp-files-holder");
+    const fileItems = state.spFiles.items.filter(i => i.file);
+    if(fileItems.length === 0){
+      filesHolder.innerHTML = `<div class="empty-note">No files found directly in this folder (only subfolders, or it's empty).</div>`;
+    } else {
+      const table = document.createElement("table");
+      table.className = "data-table";
+      table.innerHTML = `
+        <tr><th style="text-align:left;">File</th><th>Size</th><th>Last modified</th><th>Import into</th></tr>
+        ${fileItems.map((f,i)=>`
+          <tr>
+            <td style="text-align:left;">${escHtml(f.name)}</td>
+            <td class="num">${(f.size/1024).toFixed(0)} KB</td>
+            <td>${new Date(f.lastModifiedDateTime).toLocaleDateString()}</td>
+            <td>
+              <select class="sp-target-select" data-idx="${i}">
+                ${FILE_TYPES.map(ft=>`<option value="${ft.key}">${ft.label}</option>`).join("")}
+              </select>
+              <button class="btn small sp-import-btn" data-idx="${i}">Import</button>
+            </td>
+          </tr>`).join("")}
+      `;
+      filesHolder.appendChild(table);
+
+      table.querySelectorAll(".sp-import-btn").forEach(btn=>{
+        btn.addEventListener("click", async ()=>{
+          const idx = btn.getAttribute("data-idx");
+          const targetKey = table.querySelector(`.sp-target-select[data-idx="${idx}"]`).value;
+          const f = fileItems[idx];
+          const statusEl = section.querySelector("#sp-status");
+          statusEl.textContent = `Downloading "${f.name}"…`;
+          btn.disabled = true;
+          try{
+            const bytes = await fetchSharePointFileBytes(state.spFiles.driveId, f.id, spAccessToken);
+            statusEl.textContent = `Parsing "${f.name}"…`;
+            await importSharePointFile(targetKey, f.name, bytes);
+          }catch(e){
+            statusEl.textContent = `Import failed: ${e.message}`;
+            btn.disabled = false;
+          }
+        });
+      });
+    }
+  }
+
+  return section;
 }
 
 function uploadGridEl(){
