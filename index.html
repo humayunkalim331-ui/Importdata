@@ -353,7 +353,7 @@ const MSAL_CONFIG = {
   },
   cache: { cacheLocation: "sessionStorage" },
 };
-const GRAPH_SCOPES = ["Files.Read.All", "Sites.Read.All"];
+const GRAPH_SCOPES = ["Files.Read.All"]; // Sites.Read.All deliberately excluded — Microsoft reclassified it as a high-impact permission requiring admin approval (July 2025); Files.Read.All alone covers SharePoint document library access via the same unified drive API OneDrive uses, and does not require admin consent.
 let msalInstance = null;
 let spAccessToken = null;
 
